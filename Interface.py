@@ -66,78 +66,310 @@ def loadratings(ratingstablename, ratingsfilepath, openconnection, chunksize=100
 def rangepartition(ratingstablename, numberofpartitions, openconnection):
     """
     Function to create partitions of main table based on range of ratings.
+    Each partition will contain records with ratings falling within specific ranges.
+    For N partitions:
+    - Range size = 5.0/N
+    - Partition i (0 to N-1) contains:
+        - i=0: ratings in [0, range_size]
+        - i>0: ratings in (i*range_size, (i+1)*range_size]
+    Also creates and maintains metadata table for partition information.
     """
     con = openconnection
     cur = con.cursor()
-    delta = 5 / numberofpartitions
-    RANGE_TABLE_PREFIX = 'range_part'
-    for i in range(0, numberofpartitions):
-        minRange = i * delta
-        maxRange = minRange + delta
-        table_name = RANGE_TABLE_PREFIX + str(i)
-        # Xóa bảng cũ nếu đã tồn tại
+    
+    # Create metadata table if not exists
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS RangePartitionsMetadata (
+            partition_index INTEGER PRIMARY KEY,
+            partition_table_name VARCHAR(255),
+            min_rating_exclusive FLOAT,
+            max_rating_inclusive FLOAT
+        );
+    """)
+    
+    # Clear existing metadata
+    cur.execute("DELETE FROM RangePartitionsMetadata;")
+    
+    # Calculate range size and boundaries
+    range_size = 5.0 / numberofpartitions
+    boundaries = [i * range_size for i in range(numberofpartitions + 1)]
+    
+    # Create and populate each partition
+    for i in range(numberofpartitions):
+        table_name = f'range_part{i}'
+        
+        # Drop existing partition table if exists
         cur.execute(f"DROP TABLE IF EXISTS {table_name};")
-        # Tạo bảng mới
-        cur.execute(f"CREATE TABLE {table_name} (userid integer, movieid integer, rating float);")
+        
+        # Create partition table with same schema as ratings table
+        cur.execute(f"""
+            CREATE TABLE {table_name} (
+                userid INTEGER,
+                movieid INTEGER,
+                rating FLOAT
+            );
+        """)
+        
+        # Calculate boundaries for this partition
         if i == 0:
-            cur.execute(f"INSERT INTO {table_name} (userid, movieid, rating) "
-                        f"SELECT userid, movieid, rating FROM {ratingstablename} "
-                        f"WHERE rating >= {minRange} AND rating <= {maxRange};")
+            # First partition includes lower bound (0)
+            min_rating_exclusive = -0.1  # Special value for first partition
+            max_rating_inclusive = boundaries[1]
+            cur.execute(f"""
+                INSERT INTO {table_name} (userid, movieid, rating)
+                SELECT userid, movieid, rating 
+                FROM {ratingstablename}
+                WHERE rating >= 0 AND rating <= {max_rating_inclusive};
+            """)
         else:
-            cur.execute(f"INSERT INTO {table_name} (userid, movieid, rating) "
-                        f"SELECT userid, movieid, rating FROM {ratingstablename} "
-                        f"WHERE rating > {minRange} AND rating <= {maxRange};")
+            # Other partitions exclude lower bound
+            min_rating_exclusive = boundaries[i]
+            max_rating_inclusive = boundaries[i + 1]
+            cur.execute(f"""
+                INSERT INTO {table_name} (userid, movieid, rating)
+                SELECT userid, movieid, rating 
+                FROM {ratingstablename}
+                WHERE rating > {min_rating_exclusive} AND rating <= {max_rating_inclusive};
+            """)
+        
+        # Store partition metadata
+        cur.execute("""
+            INSERT INTO RangePartitionsMetadata 
+            (partition_index, partition_table_name, min_rating_exclusive, max_rating_inclusive)
+            VALUES (%s, %s, %s, %s);
+        """, (i, table_name, min_rating_exclusive, max_rating_inclusive))
+    
     con.commit()
     cur.close()
 
 def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
     """
     Function to create partitions of main table using round robin approach.
+    Each partition will contain rows distributed in a round-robin fashion.
+    Also creates and maintains metadata table for round-robin state.
     """
     con = openconnection
     cur = con.cursor()
-    RROBIN_TABLE_PREFIX = 'rrobin_part'
-    for i in range(0, numberofpartitions):
-        table_name = RROBIN_TABLE_PREFIX + str(i)
-        cur.execute("create table " + table_name + " (userid integer, movieid integer, rating float);")
-        cur.execute("insert into " + table_name + " (userid, movieid, rating) select userid, movieid, rating from (select userid, movieid, rating, ROW_NUMBER() over() as rnum from " + ratingstablename + ") as temp where mod(temp.rnum-1, 5) = " + str(i) + ";")
-    cur.close()
-    con.commit()
+    
+    try:
+        # Create metadata table for round-robin state
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS RoundRobinState (
+                singleton_id INTEGER PRIMARY KEY,
+                next_partition_index INTEGER,
+                num_partitions INTEGER
+            );
+        """)
+        
+        # Clear existing metadata
+        cur.execute("DELETE FROM RoundRobinState;")
+        
+        # Create partition tables
+        for i in range(numberofpartitions):
+            table_name = f'rrobin_part{i}'
+            
+            # Drop existing partition table if exists
+            cur.execute(f"DROP TABLE IF EXISTS {table_name};")
+            
+            # Create partition table with same schema as ratings table
+            cur.execute(f"""
+                CREATE TABLE {table_name} (
+                    userid INTEGER,
+                    movieid INTEGER,
+                    rating FLOAT
+                );
+            """)
+        
+        # Distribute data in round-robin fashion using ROW_NUMBER()
+        for i in range(numberofpartitions):
+            cur.execute(f"""
+                INSERT INTO rrobin_part{i} (userid, movieid, rating)
+                SELECT userid, movieid, rating
+                FROM (
+                    SELECT userid, movieid, rating,
+                           ROW_NUMBER() OVER () as rnum
+                    FROM {ratingstablename}
+                ) as temp
+                WHERE MOD(rnum - 1, {numberofpartitions}) = {i};
+            """)
+        
+        # Initialize round-robin state
+        cur.execute("""
+            INSERT INTO RoundRobinState (singleton_id, next_partition_index, num_partitions)
+            VALUES (1, 0, %s);
+        """, (numberofpartitions,))
+        
+        con.commit()
+        
+    except Exception as e:
+        con.rollback()
+        print(f"Debug - Error in roundrobinpartition: {str(e)}")
+        raise e
+        
+    finally:
+        cur.close()
 
 def roundrobininsert(ratingstablename, userid, itemid, rating, openconnection):
     """
     Function to insert a new row into the main table and specific partition based on round robin
-    approach.
+    approach. Uses RoundRobinState metadata to determine the next partition.
     """
     con = openconnection
     cur = con.cursor()
-    RROBIN_TABLE_PREFIX = 'rrobin_part'
-    cur.execute("insert into " + ratingstablename + "(userid, movieid, rating) values (" + str(userid) + "," + str(itemid) + "," + str(rating) + ");")
-    cur.execute("select count(*) from " + ratingstablename + ";");
-    total_rows = (cur.fetchall())[0][0]
-    numberofpartitions = count_partitions(RROBIN_TABLE_PREFIX, openconnection)
-    index = (total_rows-1) % numberofpartitions
-    table_name = RROBIN_TABLE_PREFIX + str(index)
-    cur.execute("insert into " + table_name + "(userid, movieid, rating) values (" + str(userid) + "," + str(itemid) + "," + str(rating) + ");")
-    cur.close()
-    con.commit()
+    
+    try:
+        # Start transaction
+        con.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_READ_COMMITTED)
+        
+        # 1. Insert into main ratings table
+        cur.execute("""
+            INSERT INTO {} (userid, movieid, rating)
+            VALUES (%s, %s, %s);
+        """.format(ratingstablename), (userid, itemid, rating))
+        
+        # 2. Get current round-robin state
+        cur.execute("""
+            SELECT next_partition_index, num_partitions 
+            FROM RoundRobinState 
+            WHERE singleton_id = 1;
+        """)
+        
+        result = cur.fetchone()
+        if result is None:
+            # If RoundRobinState doesn't exist, create it
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS RoundRobinState (
+                    singleton_id INTEGER PRIMARY KEY,
+                    next_partition_index INTEGER,
+                    num_partitions INTEGER
+                );
+            """)
+            
+            # Count existing partitions
+            cur.execute("""
+                SELECT COUNT(*) 
+                FROM information_schema.tables 
+                WHERE table_name LIKE 'rrobin_part%';
+            """)
+            num_partitions = cur.fetchone()[0]
+            
+            # Initialize state
+            cur.execute("""
+                INSERT INTO RoundRobinState (singleton_id, next_partition_index, num_partitions)
+                VALUES (1, 0, %s);
+            """, (num_partitions,))
+            
+            next_partition_index = 0
+        else:
+            next_partition_index, num_partitions = result
+        
+        # 3. Insert into the target partition
+        target_table = f'rrobin_part{next_partition_index}'
+        cur.execute("""
+            INSERT INTO {} (userid, movieid, rating)
+            VALUES (%s, %s, %s);
+        """.format(target_table), (userid, itemid, rating))
+        
+        # 4. Calculate next partition index
+        updated_next_index = (next_partition_index + 1) % num_partitions
+        
+        # 5. Update RoundRobinState
+        cur.execute("""
+            UPDATE RoundRobinState 
+            SET next_partition_index = %s 
+            WHERE singleton_id = 1;
+        """, (updated_next_index,))
+        
+        # Commit transaction
+        con.commit()
+        print(f"Debug - Successfully inserted into {target_table}")
+        
+    except Exception as e:
+        con.rollback()
+        print(f"Debug - Error during insert: {str(e)}")
+        raise e
+        
+    finally:
+        cur.close()
 
 def rangeinsert(ratingstablename, userid, itemid, rating, openconnection):
     """
     Function to insert a new row into the main table and specific partition based on range rating.
+    Uses RangePartitionsMetadata to determine the correct partition.
+    
+    Args:
+        ratingstablename: Name of the main ratings table
+        userid: User ID of the new rating
+        itemid: Movie ID of the new rating
+        rating: Rating value
+        openconnection: Database connection
     """
     con = openconnection
     cur = con.cursor()
-    RANGE_TABLE_PREFIX = 'range_part'
-    numberofpartitions = count_partitions(RANGE_TABLE_PREFIX, openconnection)
-    delta = 5 / numberofpartitions
-    index = int(rating / delta)
-    if rating % delta == 0 and index != 0:
-        index = index - 1
-    table_name = RANGE_TABLE_PREFIX + str(index)
-    cur.execute("insert into " + table_name + "(userid, movieid, rating) values (" + str(userid) + "," + str(itemid) + "," + str(rating) + ");")
-    cur.close()
-    con.commit()
+    
+    try:
+        # Start transaction
+        con.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_READ_COMMITTED)
+        
+        # 1. Insert into main ratings table
+        cur.execute("""
+            INSERT INTO {} (userid, movieid, rating)
+            VALUES (%s, %s, %s);
+        """.format(ratingstablename), (userid, itemid, rating))
+        
+        # 2. Find the correct partition using metadata
+        cur.execute("""
+            SELECT partition_table_name, min_rating_exclusive, max_rating_inclusive
+            FROM RangePartitionsMetadata 
+            WHERE %s > min_rating_exclusive 
+            AND %s <= max_rating_inclusive;
+        """, (rating, rating))
+        
+        result = cur.fetchone()
+        if result is None:
+            # If no partition found, try to find the partition that contains this rating
+            cur.execute("""
+                SELECT partition_table_name, min_rating_exclusive, max_rating_inclusive
+                FROM RangePartitionsMetadata 
+                ORDER BY min_rating_exclusive;
+            """)
+            all_partitions = cur.fetchall()
+            print(f"Debug - Rating {rating} not found in any partition. Available partitions:")
+            for p in all_partitions:
+                print(f"Partition {p[0]}: {p[1]} < rating <= {p[2]}")
+            raise Exception(f"No suitable partition found for rating value: {rating}")
+            
+        partition_table = result[0]
+        print(f"Debug - Found partition {partition_table} for rating {rating}")
+        
+        # 3. Insert into the correct partition
+        cur.execute("""
+            INSERT INTO {} (userid, movieid, rating)
+            VALUES (%s, %s, %s);
+        """.format(partition_table), (userid, itemid, rating))
+        
+        # 4. Verify the insert
+        cur.execute("""
+            SELECT COUNT(*) FROM {} 
+            WHERE userid = %s AND movieid = %s AND rating = %s;
+        """.format(partition_table), (userid, itemid, rating))
+        
+        count = cur.fetchone()[0]
+        if count != 1:
+            raise Exception(f"Insert verification failed. Expected 1 row, found {count}")
+        
+        # Commit transaction
+        con.commit()
+        print(f"Debug - Successfully inserted into {partition_table}")
+        
+    except Exception as e:
+        # Rollback in case of error
+        con.rollback()
+        print(f"Debug - Error during insert: {str(e)}")
+        raise e
+        
+    finally:
+        cur.close()
 
 def create_db(dbname):
     """
