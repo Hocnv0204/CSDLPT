@@ -1,28 +1,66 @@
 #!/usr/bin/python2.7
 #
-# Interface for the assignement
+# Interface cho bài tập phân tán
 #
 
 import psycopg2
 from psycopg2.extras import execute_values
+import os
+from dotenv import load_dotenv
 
-DATABASE_NAME = 'dds_assgn1'
+# Tải các biến môi trường từ file .env
+load_dotenv()
+
+# Lấy cấu hình database từ biến môi trường
+DATABASE_NAME = os.getenv('DB_NAME')
+DB_USER = os.getenv('DB_USER')
+DB_PASSWORD = os.getenv('DB_PASSWORD')
+DB_HOST = os.getenv('DB_HOST')
+DB_PORT = os.getenv('DB_PORT')
 
 
-def getopenconnection(user='postgres', password='1234', dbname='postgres'):
-    return psycopg2.connect("dbname='" + dbname + "' user='" + user + "' host='localhost' password='" + password + "'")
+def getopenconnection(user=None, password=None, dbname=None):
+    """
+    Hàm tạo kết nối đến database sử dụng biến môi trường hoặc tham số được truyền vào
+    
+    Args:
+        user: Tên người dùng database (tùy chọn)
+        password: Mật khẩu database (tùy chọn)
+        dbname: Tên database (tùy chọn)
+    
+    Returns:
+        Kết nối đến database
+    """
+    # Sử dụng biến môi trường nếu không có tham số được truyền vào
+    user = user or DB_USER
+    password = password or DB_PASSWORD
+    dbname = dbname or DATABASE_NAME
+    
+    return psycopg2.connect(
+        dbname=dbname,
+        user=user,
+        password=password,
+        host=DB_HOST,
+        port=DB_PORT
+    )
 
 
 def loadratings(ratingstablename, ratingsfilepath, openconnection, chunksize=10000):
     """
-    Load data from ratingsfilepath into ratingstablename in chunks.
-    """
+    Hàm tải dữ liệu từ file ratings vào bảng ratings trong database.
+    Dữ liệu được tải theo từng chunk để tối ưu hiệu suất.
 
+    Args:
+        ratingstablename: Tên bảng ratings
+        ratingsfilepath: Đường dẫn đến file chứa dữ liệu ratings
+        openconnection: Kết nối database
+        chunksize: Kích thước mỗi chunk khi tải dữ liệu (mặc định: 10000)
+    """
     con = openconnection
     cur = con.cursor()
     # Xóa bảng nếu đã tồn tại để tránh dữ liệu bị lặp
     cur.execute(f"DROP TABLE IF EXISTS {ratingstablename};")
-    # Tạo bảng mới
+    # Tạo bảng mới với schema phù hợp
     cur.execute(f"""
         CREATE TABLE {ratingstablename} (
             userid INTEGER,
@@ -33,7 +71,7 @@ def loadratings(ratingstablename, ratingsfilepath, openconnection, chunksize=100
     con.commit()
 
     def parse_line(line):
-        # Xử lý dòng dữ liệu: 1::122::5::838985046
+        # Xử lý dòng dữ liệu theo định dạng: userid::movieid::rating::timestamp
         parts = line.strip().split("::")
         if len(parts) >= 3:
             return (int(parts[0]), int(parts[1]), float(parts[2]))
@@ -53,7 +91,7 @@ def loadratings(ratingstablename, ratingsfilepath, openconnection, chunksize=100
                 )
                 con.commit()
                 batch = []
-        # Insert phần còn lại
+        # Chèn phần dữ liệu còn lại
         if batch:
             execute_values(
                 cur,
@@ -65,19 +103,26 @@ def loadratings(ratingstablename, ratingsfilepath, openconnection, chunksize=100
 
 def rangepartition(ratingstablename, numberofpartitions, openconnection):
     """
-    Function to create partitions of main table based on range of ratings.
-    Each partition will contain records with ratings falling within specific ranges.
-    For N partitions:
-    - Range size = 5.0/N
-    - Partition i (0 to N-1) contains:
-        - i=0: ratings in [0, range_size]
-        - i>0: ratings in (i*range_size, (i+1)*range_size]
-    Also creates and maintains metadata table for partition information.
+    Hàm tạo các partition của bảng chính dựa trên khoảng giá trị của ratings.
+    Mỗi partition sẽ chứa các bản ghi có rating nằm trong một khoảng cụ thể.
+    
+    Với N partition:
+    - Kích thước khoảng = 5.0/N
+    - Partition i (0 đến N-1) chứa:
+        - i=0: ratings trong [0, range_size]
+        - i>0: ratings trong (i*range_size, (i+1)*range_size]
+    
+    Đồng thời tạo và duy trì bảng metadata để lưu thông tin về các partition.
+
+    Args:
+        ratingstablename: Tên bảng ratings
+        numberofpartitions: Số lượng partition cần tạo
+        openconnection: Kết nối database
     """
     con = openconnection
     cur = con.cursor()
     
-    # Create metadata table if not exists
+    # Tạo bảng metadata nếu chưa tồn tại
     cur.execute("""
         CREATE TABLE IF NOT EXISTS RangePartitionsMetadata (
             partition_index INTEGER PRIMARY KEY,
@@ -87,21 +132,21 @@ def rangepartition(ratingstablename, numberofpartitions, openconnection):
         );
     """)
     
-    # Clear existing metadata
+    # Xóa metadata cũ
     cur.execute("DELETE FROM RangePartitionsMetadata;")
     
-    # Calculate range size and boundaries
+    # Tính toán kích thước khoảng và ranh giới
     range_size = 5.0 / numberofpartitions
     boundaries = [i * range_size for i in range(numberofpartitions + 1)]
     
-    # Create and populate each partition
+    # Tạo và điền dữ liệu cho từng partition
     for i in range(numberofpartitions):
         table_name = f'range_part{i}'
         
-        # Drop existing partition table if exists
+        # Xóa bảng partition nếu đã tồn tại
         cur.execute(f"DROP TABLE IF EXISTS {table_name};")
         
-        # Create partition table with same schema as ratings table
+        # Tạo bảng partition với schema giống bảng ratings
         cur.execute(f"""
             CREATE TABLE {table_name} (
                 userid INTEGER,
@@ -110,10 +155,10 @@ def rangepartition(ratingstablename, numberofpartitions, openconnection):
             );
         """)
         
-        # Calculate boundaries for this partition
+        # Tính toán ranh giới cho partition này
         if i == 0:
-            # First partition includes lower bound (0)
-            min_rating_exclusive = -0.1  # Special value for first partition
+            # Partition đầu tiên bao gồm cả giá trị 0
+            min_rating_exclusive = -0.1  # Giá trị đặc biệt cho partition đầu tiên
             max_rating_inclusive = boundaries[1]
             cur.execute(f"""
                 INSERT INTO {table_name} (userid, movieid, rating)
@@ -122,7 +167,7 @@ def rangepartition(ratingstablename, numberofpartitions, openconnection):
                 WHERE rating >= 0 AND rating <= {max_rating_inclusive};
             """)
         else:
-            # Other partitions exclude lower bound
+            # Các partition khác loại trừ giá trị dưới
             min_rating_exclusive = boundaries[i]
             max_rating_inclusive = boundaries[i + 1]
             cur.execute(f"""
@@ -132,7 +177,7 @@ def rangepartition(ratingstablename, numberofpartitions, openconnection):
                 WHERE rating > {min_rating_exclusive} AND rating <= {max_rating_inclusive};
             """)
         
-        # Store partition metadata
+        # Lưu metadata của partition
         cur.execute("""
             INSERT INTO RangePartitionsMetadata 
             (partition_index, partition_table_name, min_rating_exclusive, max_rating_inclusive)
@@ -144,15 +189,20 @@ def rangepartition(ratingstablename, numberofpartitions, openconnection):
 
 def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
     """
-    Function to create partitions of main table using round robin approach.
-    Each partition will contain rows distributed in a round-robin fashion.
-    Also creates and maintains metadata table for round-robin state.
+    Hàm tạo các partition của bảng chính sử dụng phương pháp round robin.
+    Mỗi partition sẽ chứa các dòng được phân phối theo kiểu round-robin.
+    Đồng thời tạo và duy trì bảng metadata để lưu trạng thái round-robin.
+
+    Args:
+        ratingstablename: Tên bảng ratings
+        numberofpartitions: Số lượng partition cần tạo
+        openconnection: Kết nối database
     """
     con = openconnection
     cur = con.cursor()
     
     try:
-        # Create metadata table for round-robin state
+        # Tạo bảng metadata cho trạng thái round-robin
         cur.execute("""
             CREATE TABLE IF NOT EXISTS RoundRobinState (
                 singleton_id INTEGER PRIMARY KEY,
@@ -161,17 +211,17 @@ def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
             );
         """)
         
-        # Clear existing metadata
+        # Xóa metadata cũ
         cur.execute("DELETE FROM RoundRobinState;")
         
-        # Create partition tables
+        # Tạo các bảng partition
         for i in range(numberofpartitions):
             table_name = f'rrobin_part{i}'
             
-            # Drop existing partition table if exists
+            # Xóa bảng partition nếu đã tồn tại
             cur.execute(f"DROP TABLE IF EXISTS {table_name};")
             
-            # Create partition table with same schema as ratings table
+            # Tạo bảng partition với schema giống bảng ratings
             cur.execute(f"""
                 CREATE TABLE {table_name} (
                     userid INTEGER,
@@ -180,7 +230,7 @@ def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
                 );
             """)
         
-        # Distribute data in round-robin fashion using ROW_NUMBER()
+        # Phân phối dữ liệu theo kiểu round-robin sử dụng ROW_NUMBER()
         for i in range(numberofpartitions):
             cur.execute(f"""
                 INSERT INTO rrobin_part{i} (userid, movieid, rating)
@@ -193,7 +243,7 @@ def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
                 WHERE MOD(rnum - 1, {numberofpartitions}) = {i};
             """)
         
-        # Initialize round-robin state
+        # Khởi tạo trạng thái round-robin
         cur.execute("""
             INSERT INTO RoundRobinState (singleton_id, next_partition_index, num_partitions)
             VALUES (1, 0, %s);
@@ -203,7 +253,7 @@ def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
         
     except Exception as e:
         con.rollback()
-        print(f"Debug - Error in roundrobinpartition: {str(e)}")
+        print(f"Debug - Lỗi trong roundrobinpartition: {str(e)}")
         raise e
         
     finally:
@@ -211,23 +261,30 @@ def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
 
 def roundrobininsert(ratingstablename, userid, itemid, rating, openconnection):
     """
-    Function to insert a new row into the main table and specific partition based on round robin
-    approach. Uses RoundRobinState metadata to determine the next partition.
+    Hàm chèn một dòng mới vào bảng chính và partition cụ thể dựa trên phương pháp round robin.
+    Sử dụng bảng metadata RoundRobinState để xác định partition tiếp theo.
+
+    Args:
+        ratingstablename: Tên bảng ratings
+        userid: ID người dùng
+        itemid: ID phim
+        rating: Giá trị rating
+        openconnection: Kết nối database
     """
     con = openconnection
     cur = con.cursor()
     
     try:
-        # Start transaction
+        # Bắt đầu transaction
         con.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_READ_COMMITTED)
         
-        # 1. Insert into main ratings table
+        # 1. Chèn vào bảng ratings chính
         cur.execute("""
             INSERT INTO {} (userid, movieid, rating)
             VALUES (%s, %s, %s);
         """.format(ratingstablename), (userid, itemid, rating))
         
-        # 2. Get current round-robin state
+        # 2. Lấy trạng thái round-robin hiện tại
         cur.execute("""
             SELECT next_partition_index, num_partitions 
             FROM RoundRobinState 
@@ -236,7 +293,7 @@ def roundrobininsert(ratingstablename, userid, itemid, rating, openconnection):
         
         result = cur.fetchone()
         if result is None:
-            # If RoundRobinState doesn't exist, create it
+            # Nếu RoundRobinState chưa tồn tại, tạo mới
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS RoundRobinState (
                     singleton_id INTEGER PRIMARY KEY,
@@ -245,7 +302,7 @@ def roundrobininsert(ratingstablename, userid, itemid, rating, openconnection):
                 );
             """)
             
-            # Count existing partitions
+            # Đếm số partition hiện có
             cur.execute("""
                 SELECT COUNT(*) 
                 FROM information_schema.tables 
@@ -253,7 +310,7 @@ def roundrobininsert(ratingstablename, userid, itemid, rating, openconnection):
             """)
             num_partitions = cur.fetchone()[0]
             
-            # Initialize state
+            # Khởi tạo trạng thái
             cur.execute("""
                 INSERT INTO RoundRobinState (singleton_id, next_partition_index, num_partitions)
                 VALUES (1, 0, %s);
@@ -263,30 +320,29 @@ def roundrobininsert(ratingstablename, userid, itemid, rating, openconnection):
         else:
             next_partition_index, num_partitions = result
         
-        # 3. Insert into the target partition
+        # 3. Chèn vào partition đích
         target_table = f'rrobin_part{next_partition_index}'
         cur.execute("""
             INSERT INTO {} (userid, movieid, rating)
             VALUES (%s, %s, %s);
         """.format(target_table), (userid, itemid, rating))
         
-        # 4. Calculate next partition index
+        # 4. Tính toán index partition tiếp theo
         updated_next_index = (next_partition_index + 1) % num_partitions
         
-        # 5. Update RoundRobinState
+        # 5. Cập nhật RoundRobinState
         cur.execute("""
             UPDATE RoundRobinState 
             SET next_partition_index = %s 
             WHERE singleton_id = 1;
         """, (updated_next_index,))
         
-        # Commit transaction
         con.commit()
-        print(f"Debug - Successfully inserted into {target_table}")
+        print(f"Debug - Đã chèn thành công vào {target_table}")
         
     except Exception as e:
         con.rollback()
-        print(f"Debug - Error during insert: {str(e)}")
+        print(f"Debug - Lỗi trong quá trình chèn: {str(e)}")
         raise e
         
     finally:
@@ -294,30 +350,30 @@ def roundrobininsert(ratingstablename, userid, itemid, rating, openconnection):
 
 def rangeinsert(ratingstablename, userid, itemid, rating, openconnection):
     """
-    Function to insert a new row into the main table and specific partition based on range rating.
-    Uses RangePartitionsMetadata to determine the correct partition.
-    
+    Hàm chèn một dòng mới vào bảng chính và partition cụ thể dựa trên giá trị rating.
+    Sử dụng bảng metadata RangePartitionsMetadata để xác định partition phù hợp.
+
     Args:
-        ratingstablename: Name of the main ratings table
-        userid: User ID of the new rating
-        itemid: Movie ID of the new rating
-        rating: Rating value
-        openconnection: Database connection
+        ratingstablename: Tên bảng ratings
+        userid: ID người dùng
+        itemid: ID phim
+        rating: Giá trị rating
+        openconnection: Kết nối database
     """
     con = openconnection
     cur = con.cursor()
     
     try:
-        # Start transaction
+        # Bắt đầu transaction
         con.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_READ_COMMITTED)
         
-        # 1. Insert into main ratings table
+        # 1. Chèn vào bảng ratings chính
         cur.execute("""
             INSERT INTO {} (userid, movieid, rating)
             VALUES (%s, %s, %s);
         """.format(ratingstablename), (userid, itemid, rating))
         
-        # 2. Find the correct partition using metadata
+        # 2. Tìm partition phù hợp sử dụng metadata
         cur.execute("""
             SELECT partition_table_name, min_rating_exclusive, max_rating_inclusive
             FROM RangePartitionsMetadata 
@@ -327,28 +383,28 @@ def rangeinsert(ratingstablename, userid, itemid, rating, openconnection):
         
         result = cur.fetchone()
         if result is None:
-            # If no partition found, try to find the partition that contains this rating
+            # Nếu không tìm thấy partition, thử tìm partition chứa rating này
             cur.execute("""
                 SELECT partition_table_name, min_rating_exclusive, max_rating_inclusive
                 FROM RangePartitionsMetadata 
                 ORDER BY min_rating_exclusive;
             """)
             all_partitions = cur.fetchall()
-            print(f"Debug - Rating {rating} not found in any partition. Available partitions:")
+            print(f"Debug - Không tìm thấy partition cho rating {rating}. Các partition có sẵn:")
             for p in all_partitions:
                 print(f"Partition {p[0]}: {p[1]} < rating <= {p[2]}")
-            raise Exception(f"No suitable partition found for rating value: {rating}")
+            raise Exception(f"Không tìm thấy partition phù hợp cho giá trị rating: {rating}")
             
         partition_table = result[0]
-        print(f"Debug - Found partition {partition_table} for rating {rating}")
+        print(f"Debug - Đã tìm thấy partition {partition_table} cho rating {rating}")
         
-        # 3. Insert into the correct partition
+        # 3. Chèn vào partition phù hợp
         cur.execute("""
             INSERT INTO {} (userid, movieid, rating)
             VALUES (%s, %s, %s);
         """.format(partition_table), (userid, itemid, rating))
         
-        # 4. Verify the insert
+        # 4. Kiểm tra việc chèn
         cur.execute("""
             SELECT COUNT(*) FROM {} 
             WHERE userid = %s AND movieid = %s AND rating = %s;
@@ -356,16 +412,15 @@ def rangeinsert(ratingstablename, userid, itemid, rating, openconnection):
         
         count = cur.fetchone()[0]
         if count != 1:
-            raise Exception(f"Insert verification failed. Expected 1 row, found {count}")
+            raise Exception(f"Kiểm tra chèn thất bại. Mong đợi 1 dòng, tìm thấy {count}")
         
-        # Commit transaction
         con.commit()
-        print(f"Debug - Successfully inserted into {partition_table}")
+        print(f"Debug - Đã chèn thành công vào {partition_table}")
         
     except Exception as e:
-        # Rollback in case of error
+        # Rollback nếu có lỗi
         con.rollback()
-        print(f"Debug - Error during insert: {str(e)}")
+        print(f"Debug - Lỗi trong quá trình chèn: {str(e)}")
         raise e
         
     finally:
@@ -373,30 +428,39 @@ def rangeinsert(ratingstablename, userid, itemid, rating, openconnection):
 
 def create_db(dbname):
     """
-    We create a DB by connecting to the default user and database of Postgres
-    The function first checks if an existing database exists for a given name, else creates it.
-    :return:None
+    Tạo database bằng cách kết nối đến user và database mặc định của Postgres.
+    Hàm kiểm tra xem database đã tồn tại chưa, nếu chưa thì tạo mới.
+
+    Args:
+        dbname: Tên database cần tạo
     """
-    # Connect to the default database
+    # Kết nối đến database mặc định
     con = getopenconnection(dbname='postgres')
     con.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
     cur = con.cursor()
 
-    # Check if an existing database with the same name exists
+    # Kiểm tra xem database đã tồn tại chưa
     cur.execute('SELECT COUNT(*) FROM pg_catalog.pg_database WHERE datname=\'%s\'' % (dbname,))
     count = cur.fetchone()[0]
     if count == 0:
-        cur.execute('CREATE DATABASE %s' % (dbname,))  # Create the database
+        cur.execute('CREATE DATABASE %s' % (dbname,))  # Tạo database
     else:
-        print('A database named {0} already exists'.format(dbname))
+        print('Database "{0}" đã tồn tại'.format(dbname))
 
-    # Clean up
+    # Dọn dẹp
     cur.close()
     con.close()
 
 def count_partitions(prefix, openconnection):
     """
-    Function to count the number of tables which have the @prefix in their name somewhere.
+    Hàm đếm số lượng bảng có chứa @prefix trong tên.
+
+    Args:
+        prefix: Tiền tố cần tìm
+        openconnection: Kết nối database
+
+    Returns:
+        Số lượng bảng tìm thấy
     """
     con = openconnection
     cur = con.cursor()
