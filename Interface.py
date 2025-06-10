@@ -7,6 +7,9 @@ import psycopg2
 from psycopg2.extras import execute_values
 import os
 from dotenv import load_dotenv
+from datetime import datetime
+import time
+from io import StringIO
 
 # Tải các biến môi trường từ file .env
 load_dotenv()
@@ -18,20 +21,7 @@ DB_PASSWORD = os.getenv('DB_PASSWORD')
 DB_HOST = os.getenv('DB_HOST')
 DB_PORT = os.getenv('DB_PORT')
 
-
 def getopenconnection(user=None, password=None, dbname=None):
-    """
-    Hàm tạo kết nối đến database sử dụng biến môi trường hoặc tham số được truyền vào
-    
-    Args:
-        user: Tên người dùng database (tùy chọn)
-        password: Mật khẩu database (tùy chọn)
-        dbname: Tên database (tùy chọn)
-    
-    Returns:
-        Kết nối đến database
-    """
-    # Sử dụng biến môi trường nếu không có tham số được truyền vào
     user = user or DB_USER
     password = password or DB_PASSWORD
     dbname = dbname or DATABASE_NAME
@@ -44,62 +34,71 @@ def getopenconnection(user=None, password=None, dbname=None):
         port=DB_PORT
     )
 
-
-def loadratings(ratingstablename, ratingsfilepath, openconnection, chunksize=10000):
+def loadratings(ratingstablename, ratingsfilepath, openconnection):
     """
-    Hàm tải dữ liệu từ file ratings vào bảng ratings trong database.
-    Dữ liệu được tải theo từng chunk để tối ưu hiệu suất.
+    Hàm tải dữ liệu từ file ratings vào bảng ratings trong PostgreSQL.
+    Sử dụng phương pháp đơn giản và hiệu quả nhất.
 
     Args:
         ratingstablename: Tên bảng ratings
         ratingsfilepath: Đường dẫn đến file chứa dữ liệu ratings
         openconnection: Kết nối database
-        chunksize: Kích thước mỗi chunk khi tải dữ liệu (mặc định: 10000)
     """
-    con = openconnection
-    cur = con.cursor()
-    # Xóa bảng nếu đã tồn tại để tránh dữ liệu bị lặp
-    cur.execute(f"DROP TABLE IF EXISTS {ratingstablename};")
-    # Tạo bảng mới với schema phù hợp
-    cur.execute(f"""
-        CREATE TABLE {ratingstablename} (
-            userid INTEGER,
-            movieid INTEGER,
-            rating FLOAT
-        );
-    """)
-    con.commit()
+    start_time = time.time()
+    print(f"\nBắt đầu tải dữ liệu vào {ratingstablename}...")
+    print(f"Thời gian bắt đầu: {datetime.now().strftime('%H:%M:%S')}")
+    
+    cur = openconnection.cursor()
 
-    def parse_line(line):
-        # Xử lý dòng dữ liệu theo định dạng: userid::movieid::rating::timestamp
-        parts = line.strip().split("::")
-        if len(parts) >= 3:
-            return (int(parts[0]), int(parts[1]), float(parts[2]))
-        return None
+    try:
+        # 1. Tạo bảng
+        cur.execute(f"DROP TABLE IF EXISTS {ratingstablename};")
+        cur.execute(f"""
+            CREATE TABLE {ratingstablename} (
+                userid INT,
+                movieid INT,
+                rating FLOAT
+            );
+        """)
 
-    batch = []
-    with open(ratingsfilepath, "r") as f:
-        for line in f:
-            row = parse_line(line)
-            if row:
-                batch.append(row)
-            if len(batch) >= chunksize:
-                execute_values(
-                    cur,
-                    f"INSERT INTO {ratingstablename} (userid, movieid, rating) VALUES %s",
-                    batch
-                )
-                con.commit()
-                batch = []
-        # Chèn phần dữ liệu còn lại
-        if batch:
-            execute_values(
-                cur,
-                f"INSERT INTO {ratingstablename} (userid, movieid, rating) VALUES %s",
-                batch
-            )
-            con.commit()
-    cur.close()
+        # 2. Xử lý và tải dữ liệu
+        buffer = StringIO()
+        with open(ratingsfilepath, 'r') as f:
+            for line in f:
+                parts = line.strip().split('::')
+                if len(parts) >= 3:
+                    buffer.write(f"{parts[0]}\t{parts[1]}\t{parts[2]}\n")
+        buffer.seek(0)
+
+        # 3. Sử dụng COPY để tải dữ liệu
+        cur.copy_from(buffer, ratingstablename, sep='\t', columns=('userid', 'movieid', 'rating'))
+
+        # 4. Tạo primary key
+        cur.execute(f"ALTER TABLE {ratingstablename} ADD PRIMARY KEY (userid, movieid);")
+
+        # 5. Commit transaction
+        openconnection.commit()
+
+        # 6. In thống kê
+        end_time = time.time()
+        total_time = end_time - start_time
+        print(f"\nThống kê hiệu suất:")
+        print(f"Tổng thời gian thực hiện: {total_time:.2f} giây")
+        print(f"Thời gian kết thúc: {datetime.now().strftime('%H:%M:%S')}")
+        
+        # Đếm số bản ghi đã tải
+        cur.execute(f"SELECT COUNT(*) FROM {ratingstablename};")
+        total_records = cur.fetchone()[0]
+        print(f"Tổng số bản ghi đã tải: {total_records:,}")
+        print(f"Tốc độ xử lý trung bình: {total_records/total_time:.0f} bản ghi/giây")
+
+    except Exception as e:
+        openconnection.rollback()
+        print(f"Error loading data: {str(e)}")
+        raise e
+        
+    finally:
+        cur.close()
 
 def rangepartition(ratingstablename, numberofpartitions, openconnection):
     """
@@ -202,6 +201,9 @@ def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
     cur = con.cursor()
     
     try:
+        # Bắt đầu transaction
+        con.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_READ_COMMITTED)
+        
         # Tạo bảng metadata cho trạng thái round-robin
         cur.execute("""
             CREATE TABLE IF NOT EXISTS RoundRobinState (

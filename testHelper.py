@@ -1,5 +1,16 @@
 import traceback
 import psycopg2
+import os
+from dotenv import load_dotenv
+
+# Tải các biến môi trường từ file .env
+load_dotenv(override=True)
+
+# Lấy cấu hình database từ biến môi trường
+DB_USER = os.getenv('DB_USER')
+DB_PASSWORD = os.getenv('DB_PASSWORD')
+DB_HOST = os.getenv('DB_HOST')
+DB_PORT = os.getenv('DB_PORT')
 
 RANGE_TABLE_PREFIX = 'range_part'
 RROBIN_TABLE_PREFIX = 'rrobin_part'
@@ -15,7 +26,7 @@ def createdb(dbname):
     :return:None
     """
     # Connect to the default database
-    con = getopenconnection()
+    con = getopenconnection(dbname)
     con.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
     cur = con.cursor()
 
@@ -51,8 +62,13 @@ def deleteAllPublicTables(openconnection):
 
     cur.close()
 
-def getopenconnection(user='postgres', password='1234', dbname='postgres'):
-    return psycopg2.connect("dbname='" + dbname + "' user='" + user + "' host='localhost' password='" + password + "'")
+def getopenconnection(dbname):
+    try:
+        con = psycopg2.connect(dbname=dbname, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT)
+        return con
+    except Exception as e:
+        print("Error connecting to the database: ", e)
+        raise
 
 
 ####### Tester support
